@@ -1,0 +1,11 @@
+.queue-section{margin-top:16px;padding-top:13px;border-top:1px solid var(--line)}
+.queue-heading{display:flex;align-items:center;justify-content:space-between;color:#8793a8;font:500 9px 'DM Mono',monospace;letter-spacing:.8px}
+.queue-heading span:last-child{letter-spacing:0;text-transform:none}
+.queue-empty{padding:12px 0 2px;color:#a0aabc;font-size:10px}
+.queue-list{list-style:none;margin:9px 0 0;padding:0;display:grid;gap:6px}
+.queue-item{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:7px;background:var(--amber-soft);color:#75613f;font-size:10px}
+.queue-position{color:#b3833c;font:10px 'DM Mono',monospace}
+.queue-waiting{margin-left:auto;color:#bc8b45;font:8px 'DM Mono',monospace;letter-spacing:.5px}
+.dark .queue-heading,.dark .queue-empty{color:#8491a7}
+.dark .queue-item{color:#ead2ab}
+.dark .queue-waiting,.dark .queue-position{color:#d4a75f}
