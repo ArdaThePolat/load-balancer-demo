@@ -6,6 +6,7 @@ type RequestItem = { id: number; createdAt: number; queuedAt?: number; source: '
 type Worker = { id: number; active: RequestItem | null; startedAt: number | null; durationMs: number | null; unhealthyUntil: number }
 type Protocol = 'push' | 'poll'
 type EventItem = { id: number; time: number; kind: 'route' | 'queue' | 'complete' | 'signal' | 'system'; text: string; signal?: { workerId: number; direction: 'to-lb' | 'to-worker'; type: 'status' | 'request' } }
+type SignalPulse = { id: number; path: string; width: number; height: number; color: string }
 type Simulation = {
   workers: Worker[]
   queue: RequestItem[]
@@ -75,8 +76,8 @@ function dispatch(sim: Simulation, request: RequestItem, now: number, minSeconds
       worker.startedAt = now
       worker.durationMs = durationMs
       sim.nextWorkerIndex = (index + 1) % count
-      addEvent(sim, 'route', `Request #${request.id} → Worker ${worker.id} · checked ${checks.join(' → ')}`, now)
       if (protocol === 'push') addEvent(sim, 'signal', `W${worker.id} → LB: “I’m busy” · status published`, now, { workerId: worker.id, direction: 'to-lb', type: 'status' })
+      addEvent(sim, 'route', `Request #${request.id} → Worker ${worker.id} · checked ${checks.join(' → ')}`, now, { workerId: worker.id, direction: 'to-worker', type: 'request' })
       return
     }
   }
@@ -155,8 +156,13 @@ export default function App() {
   const [now, setNow] = useState(Date.now())
   const topologyRef = useRef<HTMLDivElement>(null)
   const pulseSvgRef = useRef<SVGSVGElement>(null)
+  const requestPulseSvgRef = useRef<SVGSVGElement>(null)
   const lastSignalId = useRef<number | null>(null)
-  const [signalPulse, setSignalPulse] = useState<{ id: number; path: string; width: number; height: number; color: string } | null>(null)
+  const lastRequestId = useRef<number | null>(null)
+  const animatedRequestIds = useRef(new Set<number>())
+  const requestFrames = useRef(new Map<number, number>())
+  const [signalPulse, setSignalPulse] = useState<SignalPulse | null>(null)
+  const [requestPulses, setRequestPulses] = useState<SignalPulse[]>([])
 
   const send = useCallback((source: RequestItem['source']) => {
     setSimulation((current) => sendRequest(current, source, minSeconds, maxSeconds, protocol))
@@ -198,36 +204,59 @@ export default function App() {
   }, [autoTraffic, requestsPerSecond, send])
 
   useEffect(() => {
-    const event = simulation.events.find((item) => item.signal)
-    if (!event?.signal || event.id === lastSignalId.current) return
-    lastSignalId.current = event.id
+    const requestEvent = simulation.events.find((item) => item.signal?.type === 'request')
+    const statusEvent = simulation.events.find((item) => item.signal?.type === 'status')
+    if ((!requestEvent || requestEvent.id === lastRequestId.current) && (!statusEvent || statusEvent.id === lastSignalId.current)) return
     const board = topologyRef.current
-    const worker = board?.querySelector<HTMLElement>(`[data-worker-id="${event.signal.workerId}"]`)
-    const balancer = board?.querySelector<HTMLElement>('.load-balancer-node')
-    if (!board || !worker || !balancer) return
+    if (!board) return
     const rect = board.getBoundingClientRect()
-    const workerRect = worker.getBoundingClientRect()
-    const lbRect = balancer.getBoundingClientRect()
-    const workerNodes = board.querySelector<HTMLElement>('.worker-nodes')
     const narrow = window.matchMedia('(max-width: 600px)').matches
-    const branchStyle = getComputedStyle(worker, event.signal.type === 'status' ? '::after' : '::before')
-    const railStyle = workerNodes && getComputedStyle(workerNodes, event.signal.type === 'status' ? '::after' : '::before')
-    const lbX = lbRect.right - rect.left
-    const lbCenterY = lbRect.top + lbRect.height / 2 - rect.top
-    const workerEdgeX = workerRect.left - rect.left
-    const workerBranchX = workerEdgeX + parseFloat(branchStyle.left || '0')
-    const workerBranchY = workerRect.top + parseFloat(branchStyle.top || `${workerRect.height / 2}px`) - rect.top
-    const branch = workerNodes?.getBoundingClientRect()
-    const railOffset = parseFloat(railStyle?.left || '0')
-    const railX = branch ? (narrow ? branch.left + branch.width * railOffset / 100 : branch.left + railOffset) - rect.left : (lbX + workerBranchX) / 2
-    const boardCenterX = rect.width / 2 + (event.signal.type === 'status' ? 3 : -4)
-    const bridgeY = narrow ? lbRect.bottom - rect.top + 21 : rect.height / 2 + (event.signal.type === 'status' ? 3 : -3)
-    const path = narrow
-      ? `M ${workerEdgeX} ${workerBranchY} H ${railX} V ${branch ? branch.top - rect.top : workerBranchY} H ${boardCenterX} V ${lbRect.bottom - rect.top}`
-      : `M ${workerEdgeX} ${workerBranchY} H ${railX} V ${bridgeY} H ${lbX} V ${lbCenterY}`
-    setSignalPulse({ id: event.id, path, width: rect.width, height: rect.height, color: event.signal.type === 'status' ? '#24a879' : '#536ff0' })
-    const timer = window.setTimeout(() => setSignalPulse((active) => active?.id === event.id ? null : active), 850)
-    return () => window.clearTimeout(timer)
+
+    const createPulse = (event: EventItem): SignalPulse | null => {
+      if (!event.signal) return null
+      const worker = board.querySelector<HTMLElement>(`[data-worker-id="${event.signal.workerId}"]`)
+      const balancer = board.querySelector<HTMLElement>('.load-balancer-node')
+      if (!worker || !balancer) return null
+      const workerRect = worker.getBoundingClientRect()
+      const lbRect = balancer.getBoundingClientRect()
+      const workerNodes = board.querySelector<HTMLElement>('.worker-nodes')
+      const isRequest = event.signal.type === 'request'
+      const branchStyle = getComputedStyle(worker, isRequest ? '::before' : '::after')
+      const railStyle = workerNodes && getComputedStyle(workerNodes, isRequest ? '::before' : '::after')
+      const lbX = lbRect.right - rect.left
+      const lbCenterY = lbRect.top + lbRect.height / 2 - rect.top
+      const workerEdgeX = workerRect.left - rect.left
+      const workerBranchX = workerEdgeX + parseFloat(branchStyle.left || '0')
+      const workerBranchY = workerRect.top + parseFloat(branchStyle.top || `${workerRect.height / 2}px`) - rect.top
+      const branch = workerNodes?.getBoundingClientRect()
+      const railOffset = parseFloat(railStyle?.left || '0')
+      const railX = branch ? (narrow ? branch.left + branch.width * railOffset / 100 : branch.left + railOffset) - rect.left : (lbX + workerBranchX) / 2
+      const boardCenterX = rect.width / 2 + (isRequest ? -4 : 3)
+      const bridgeY = narrow ? lbRect.bottom - rect.top + 21 : rect.height / 2 + (isRequest ? -3 : 3)
+      const path = isRequest
+        ? narrow
+          ? `M ${boardCenterX} ${lbRect.bottom - rect.top} V ${branch ? branch.top - rect.top : workerBranchY} H ${railX} V ${workerBranchY} H ${workerEdgeX}`
+          : `M ${lbX} ${lbCenterY} H ${railX} V ${workerBranchY} H ${workerEdgeX}`
+        : narrow
+          ? `M ${workerEdgeX} ${workerBranchY} H ${railX} V ${branch ? branch.top - rect.top : workerBranchY} H ${boardCenterX} V ${lbRect.bottom - rect.top}`
+          : `M ${workerEdgeX} ${workerBranchY} H ${railX} V ${bridgeY} H ${lbX} V ${lbCenterY}`
+      return { id: event.id, path, width: rect.width, height: rect.height, color: isRequest ? '#536ff0' : '#24a879' }
+    }
+
+    if (requestEvent && requestEvent.id !== lastRequestId.current) {
+      lastRequestId.current = requestEvent.id
+      const pulse = createPulse(requestEvent)
+      if (pulse) setRequestPulses((current) => [...current, pulse])
+    }
+    if (statusEvent && statusEvent.id !== lastSignalId.current) {
+      lastSignalId.current = statusEvent.id
+      const pulse = createPulse(statusEvent)
+      if (pulse) {
+        setSignalPulse(pulse)
+        const timer = window.setTimeout(() => setSignalPulse((active) => active?.id === statusEvent.id ? null : active), 850)
+        return () => window.clearTimeout(timer)
+      }
+    }
   }, [simulation.events])
 
   useEffect(() => {
@@ -249,6 +278,46 @@ export default function App() {
     frame = window.requestAnimationFrame(animate)
     return () => window.cancelAnimationFrame(frame)
   }, [signalPulse])
+
+  useEffect(() => {
+    const svg = requestPulseSvgRef.current
+    if (!svg) return
+    const liveIds = new Set(requestPulses.map((pulse) => pulse.id))
+    for (const [id, frame] of requestFrames.current) {
+      if (!liveIds.has(id)) {
+        window.cancelAnimationFrame(frame)
+        requestFrames.current.delete(id)
+      }
+    }
+    for (const pulse of requestPulses) {
+      if (animatedRequestIds.current.has(pulse.id)) continue
+      const path = svg.querySelector<SVGPathElement>(`[data-request-path="${pulse.id}"]`)
+      const dot = svg.querySelector<SVGCircleElement>(`[data-request-dot="${pulse.id}"]`)
+      if (!path || !dot) continue
+      animatedRequestIds.current.add(pulse.id)
+      const length = path.getTotalLength()
+      const started = performance.now()
+      const animate = (time: number) => {
+        const progress = Math.min(1, (time - started) / 750)
+        const point = path.getPointAtLength(length * progress)
+        dot.setAttribute('cx', String(point.x))
+        dot.setAttribute('cy', String(point.y))
+        dot.setAttribute('opacity', progress < 1 ? '1' : '0')
+        if (progress < 1) requestFrames.current.set(pulse.id, window.requestAnimationFrame(animate))
+        else {
+          requestFrames.current.delete(pulse.id)
+          animatedRequestIds.current.delete(pulse.id)
+          setRequestPulses((current) => current.filter((item) => item.id !== pulse.id))
+        }
+      }
+      requestFrames.current.set(pulse.id, window.requestAnimationFrame(animate))
+    }
+  }, [requestPulses])
+
+  useEffect(() => () => {
+    for (const frame of requestFrames.current.values()) window.cancelAnimationFrame(frame)
+    requestFrames.current.clear()
+  }, [])
 
   const activeCount = simulation.workers.filter((worker) => worker.active).length
   const idleCount = simulation.workers.filter((worker) => !worker.active && worker.unhealthyUntil <= now).length
@@ -354,7 +423,8 @@ export default function App() {
                     </article>
                   })}
                 </div>
-                {signalPulse && <svg ref={pulseSvgRef} className="signal-animation-layer" width={signalPulse.width} height={signalPulse.height} viewBox={`0 0 ${signalPulse.width} ${signalPulse.height}`} aria-hidden="true"><path className="signal-motion-path" d={signalPulse.path}/><circle className="signal-motion-dot" r="4.5" cx="0" cy="0" opacity="0" fill={signalPulse.color}/></svg>}
+                {signalPulse && <svg ref={pulseSvgRef} className="signal-animation-layer" width={signalPulse.width} height={signalPulse.height} viewBox={`0 0 ${signalPulse.width} ${signalPulse.height}`} aria-hidden="true"><path className="signal-motion-path" d={signalPulse.path} fill="none" stroke="none"/><circle className="signal-motion-dot" r="4.5" cx="0" cy="0" opacity="0" fill={signalPulse.color}/></svg>}
+                {requestPulses.length > 0 && <svg ref={requestPulseSvgRef} className="signal-animation-layer" width={requestPulses[0].width} height={requestPulses[0].height} viewBox={`0 0 ${requestPulses[0].width} ${requestPulses[0].height}`} aria-hidden="true"><defs>{requestPulses.map((pulse) => <path data-request-path={pulse.id} d={pulse.path} key={pulse.id}/>)}</defs>{requestPulses.map((pulse) => <circle className="signal-motion-dot" data-request-dot={pulse.id} key={pulse.id} r="6" cx="0" cy="0" opacity="0" fill={pulse.color}/>)}</svg>}
               </div>
               <div className={`connector-legend ${protocol}`}><span className="legend-request"><i/>Request to worker</span><span className="legend-status"><i/>{protocol === 'push' ? 'Status published to LB' : 'LB asks “Are you idle?”'}</span></div>
             </div>
@@ -366,8 +436,8 @@ export default function App() {
           </section>
 
           <aside className="panel activity-panel">
-            <div className="panel-heading activity-heading"><div><div className="section-kicker">LIVE TRACE</div><h2>Activity</h2></div><span className="live-indicator"><span className="live-dot"/>LIVE</span></div>
-            <ol className="event-list" aria-live="polite" aria-label="Routing activity">
+            <div className="panel-heading activity-heading"><div><div className="section-kicker">REQUEST FLOW · LIVE TRACE</div><h2>Requests & activity</h2></div><span className="live-indicator"><span className="live-dot"/>LIVE</span></div>
+            <ol className="event-list" aria-live="polite" aria-label="Request routing and worker activity">
               {recentEvents.map((event) => <li className={`event-item event-${event.kind}`} key={event.id}><span className="event-marker"/><div className="event-content"><div className="event-text">{event.text}</div><time>{formatTime(event.time)}</time></div></li>)}
             </ol>
           </aside>
